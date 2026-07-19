@@ -386,6 +386,36 @@ async def scrape_batch(req: ScrapeBatchRequest, authorization: Optional[str] = H
     return await asyncio.gather(*[_do_one(it) for it in req.items])
 
 
+@app.post("/debug-egress")
+async def debug_egress(authorization: Optional[str] = Header(None)):
+    """Diagnóstico: IP de salida CON proxy y SIN proxy, para confirmar que el
+    proxy US está bien configurado en el contenedor. No expone la password."""
+    _check_auth(authorization)
+    from scrapling.fetchers import Fetcher
+
+    def _probe():
+        out = {
+            "proxy_configured": bool(PROXY_URL),
+            "proxy_host": urlparse(PROXY_URL).hostname if PROXY_URL else None,
+            "proxy_user": (urlparse(PROXY_URL).username or "")[:12] if PROXY_URL else None,
+        }
+        for etiqueta, usar_proxy in (("via_proxy", True), ("direct", False)):
+            try:
+                p = Fetcher.get(
+                    "https://api.ipify.org?format=json",
+                    proxy=(PROXY_URL if usar_proxy else None),
+                    impersonate="chrome", timeout=30,
+                )
+                body = p.body.decode("utf-8", "ignore") if isinstance(p.body, bytes) else (p.body or "")
+                out[etiqueta] = {"status": getattr(p, "status", 0), "body": body[:120]}
+            except Exception as e:
+                out[etiqueta] = {"error": f"{type(e).__name__}: {e}"}
+        return out
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, _probe)
+
+
 @app.post("/fetch-json")
 async def fetch_json(req: FetchRequest, authorization: Optional[str] = Header(None)):
     """Devuelve el body crudo de un endpoint JSON de RedSky (search o pdp), buscado
