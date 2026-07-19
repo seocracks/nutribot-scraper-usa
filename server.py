@@ -214,25 +214,33 @@ def _json_de_respuesta(body: str) -> str:
     return body
 
 
-def _redsky_get_json(url: str, timeout: int) -> tuple[Optional[str], str]:
+def _redsky_get_json(url: str, timeout: int, intentos: int = 3) -> tuple[Optional[str], str]:
     """GET a RedSky con el navegador real (Camoufox). Akamai sirve un CAPTCHA al
     fetcher rápido (curl_cffi impersonate) pero deja pasar al browser real, que
     devuelve el JSON envuelto en <pre> (verificado 2026-07-19: fetcher→403 captcha,
     stealthy→JSON válido). Se IGNORA el status HTTP (RedSky puede dar 403 con el
     JSON correcto en el body) y se valida que el body extraído sea JSON parseable.
 
+    REINTENTOS: el proxy DataImpulse es rotativo y Akamai bloquea según la IP
+    concreta que toque (medido: ~1 de cada 3 intentos pasa). Cada reintento sale
+    por una IP distinta → con 3 intentos la tasa de éxito sube a >90 %.
+
     Devuelve (json_str, error). json_str None si no se pudo extraer JSON."""
-    try:
-        _, html_body = _http_get(url, "stealthy", timeout, accept_json=False)
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
-    js = _json_de_respuesta(html_body)
-    try:
-        json.loads(js)
-    except Exception:
-        preview = (html_body or "")[:160].replace("\n", " ")
-        return None, f"respuesta no-JSON ({len(html_body or '')}B): {preview}"
-    return js, ""
+    ultimo_err = ""
+    for i in range(max(1, intentos)):
+        try:
+            _, html_body = _http_get(url, "stealthy", timeout, accept_json=False)
+        except Exception as e:
+            ultimo_err = f"{type(e).__name__}: {e}"
+            continue
+        js = _json_de_respuesta(html_body)
+        try:
+            json.loads(js)
+            return js, ""
+        except Exception:
+            ultimo_err = f"captcha/no-JSON ({len(html_body or '')}B)"
+            log.info("RedSky intento %d/%d sin JSON (IP bloqueada), reintentando", i + 1, intentos)
+    return None, ultimo_err
 
 
 def _scrape_target(url: str, timeout: int) -> dict:
