@@ -416,6 +416,29 @@ async def debug_egress(authorization: Optional[str] = Header(None)):
     return await loop.run_in_executor(_executor, _probe)
 
 
+@app.post("/debug-fetch")
+async def debug_fetch(req: FetchRequest, authorization: Optional[str] = Header(None)):
+    """Diagnóstico: busca una URL de Target con AMBOS motores (fetcher rápido y
+    stealthy/Camoufox) y devuelve el status + preview de cada uno, sin ocultar
+    el error tras un 502. Solo target.com."""
+    _check_auth(authorization)
+    if "target.com" not in urlparse(req.url).netloc.lower():
+        raise HTTPException(400, "solo target.com")
+
+    def _probe():
+        res = {}
+        for fet in ("fetcher", "stealthy"):
+            try:
+                st, body = _http_get(req.url, fet, req.timeout, accept_json=(fet == "fetcher"))
+                res[fet] = {"status": st, "len": len(body or ""), "preview": (body or "")[:200]}
+            except Exception as e:
+                res[fet] = {"error": f"{type(e).__name__}: {e}"}
+        return res
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, _probe)
+
+
 @app.post("/fetch-json")
 async def fetch_json(req: FetchRequest, authorization: Optional[str] = Header(None)):
     """Devuelve el body crudo de un endpoint JSON de RedSky (search o pdp), buscado
