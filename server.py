@@ -26,6 +26,7 @@ import json
 import random
 import logging
 import asyncio
+from html import unescape
 from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
@@ -196,6 +197,44 @@ def _normalizar_item_target(item: dict, price_block: dict) -> dict:
     }
 
 
+def _json_de_respuesta(body: str) -> str:
+    """Extrae el JSON de la respuesta de RedSky vía Camoufox. El navegador real
+    envuelve el JSON en <html><body><pre>{...}</pre></body></html>; el fetcher
+    rápido lo devuelve crudo. Cubre ambos casos."""
+    body = (body or "").strip()
+    if body.startswith("{") or body.startswith("["):
+        return body
+    m = re.search(r"<pre[^>]*>(.*?)</pre>", body, re.DOTALL | re.IGNORECASE)
+    if m:
+        return unescape(m.group(1).strip())
+    # Fallback: del primer { al último } (por si el <pre> trae atributos raros).
+    i, j = body.find("{"), body.rfind("}")
+    if i != -1 and j > i:
+        return body[i:j + 1]
+    return body
+
+
+def _redsky_get_json(url: str, timeout: int) -> tuple[Optional[str], str]:
+    """GET a RedSky con el navegador real (Camoufox). Akamai sirve un CAPTCHA al
+    fetcher rápido (curl_cffi impersonate) pero deja pasar al browser real, que
+    devuelve el JSON envuelto en <pre> (verificado 2026-07-19: fetcher→403 captcha,
+    stealthy→JSON válido). Se IGNORA el status HTTP (RedSky puede dar 403 con el
+    JSON correcto en el body) y se valida que el body extraído sea JSON parseable.
+
+    Devuelve (json_str, error). json_str None si no se pudo extraer JSON."""
+    try:
+        _, html_body = _http_get(url, "stealthy", timeout, accept_json=False)
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    js = _json_de_respuesta(html_body)
+    try:
+        json.loads(js)
+    except Exception:
+        preview = (html_body or "")[:160].replace("\n", " ")
+        return None, f"respuesta no-JSON ({len(html_body or '')}B): {preview}"
+    return js, ""
+
+
 def _scrape_target(url: str, timeout: int) -> dict:
     """Target: RedSky pdp_client_v1 por tcin (precio de la tienda de referencia)."""
     tcin = _tcin_de_url(url)
@@ -208,23 +247,18 @@ def _scrape_target(url: str, timeout: int) -> dict:
         f"?key={TARGET_API_KEY}&tcin={tcin}&is_bot=false&channel=WEB"
         f"&pricing_store_id={TARGET_STORE_ID}&store_id={TARGET_STORE_ID}&zip={TARGET_ZIP}"
     )
-    status_code, body = _http_get(pdp, "fetcher", timeout, accept_json=True)
-    if status_code != 200 or not body.lstrip().startswith("{"):
-        preview = body.lstrip()[:120].replace("\n", " ").strip()
-        return {"http_code": status_code, "size_bytes": len(body), "es_ficha": False,
-                "error": f"RedSky pdp HTTP {status_code}: {preview or '(vacío)'}"}
-    try:
-        data = json.loads(body)
-    except Exception as e:
-        return {"http_code": status_code, "size_bytes": len(body), "es_ficha": False,
-                "error": f"JSON inválido RedSky: {e}"}
+    js, err = _redsky_get_json(pdp, timeout)
+    if err or js is None:
+        return {"http_code": 502, "size_bytes": 0, "es_ficha": False,
+                "error": f"RedSky pdp: {err}"}
+    data = json.loads(js)
 
     product = ((data.get("data") or {}).get("product")) or {}
     item = product.get("item") or {}
     price_block = product.get("price") or {}
     r = _normalizar_item_target(item, price_block)
-    r["http_code"] = status_code
-    r["size_bytes"] = len(body)
+    r["http_code"] = 200
+    r["size_bytes"] = len(js)
     return r
 
 
@@ -306,17 +340,17 @@ def _scrape_blocking(url: str, fetcher: str, timeout: int) -> dict:
 
 
 def _fetch_json_blocking(url: str, timeout: int) -> tuple[int, str, str]:
-    """GET crudo de un endpoint JSON whitelisted (RedSky search/pdp). Devuelve
-    (status, body, error). Es lo que desbloquea el import de Target: el PHP arma
-    la URL de RedSky y aquí se busca con el TLS de Chrome + proxy US."""
+    """GET de un endpoint JSON whitelisted de RedSky (search/pdp) con el navegador
+    real (Camoufox) — el fetcher rápido recibe CAPTCHA de Akamai. Devuelve
+    (status, json_str, error). Es lo que desbloquea el import de Target: el PHP
+    arma la URL de RedSky y aquí se obtiene el JSON pasando el bot-management."""
     host = urlparse(url).netloc.lower()
     if host not in _FETCH_JSON_HOSTS:
         return 400, "", f"host no permitido: {host}"
-    try:
-        status_code, body = _http_get(url, "fetcher", timeout, accept_json=True)
-        return status_code, body, ""
-    except Exception as e:
-        return 0, "", f"{type(e).__name__}: {e}"
+    js, err = _redsky_get_json(url, timeout)
+    if err or js is None:
+        return 502, "", err
+    return 200, js, ""
 
 
 def _fetch_html_blocking(url: str, timeout: int) -> tuple[int, str, str]:
