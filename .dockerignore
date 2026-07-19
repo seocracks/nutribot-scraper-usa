@@ -1,0 +1,16 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.html
+dump-*.html
+test_*.py
+scrape_carrefour.py
+.env
+.env.*
+*.log
+.git/
+README.md
+__pycache__/
