@@ -21,15 +21,11 @@ Configuración: variables de entorno (ver README).
 """
 import os
 import re
-import sys
 import time
 import json
-import signal
-import base64
 import random
 import logging
 import asyncio
-import subprocess
 from html import unescape
 from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor
@@ -136,78 +132,11 @@ _BLOCKED_DOMAINS = {
 }
 
 
-# ─── BLINDAJE (2026-07-22): Camoufox en subproceso con matadero duro ───
-# PROBLEMA medido: con ThreadPoolExecutor, un StealthyFetcher.fetch() que se
-# cuelga POR ENCIMA de su timeout (Firefox zombi en el lanzamiento o CONNECT del
-# proxy, algo que el timeout de navegación NO cubre) deja el HILO atascado para
-# siempre — y en Python un hilo no se puede matar. Tras una carga larga los 2
-# workers acabaron zombis, reteniendo los 2 slots del semáforo; /health seguía
-# OK (es async, no usa el executor) mientras el scrape estaba muerto. La cola de
-# Target quedó 15h con 0 éxitos.
-#
-# FIX: cada scrape con browser real corre en un SUBPROCESO fresco (`python -c`,
-# intérprete nuevo → sin fork-hazards con el server async ni acumulación de
-# estado). Con start_new_session=True el hijo es líder de grupo, así que si se
-# cuelga se mata el GRUPO ENTERO (hijo + Firefox nietos) con os.killpg → el slot
-# se libera SIEMPRE dentro de `hard` segundos. El proxy va por stdin (no en argv:
-# no se ve en `ps`).
-_STEALTHY_WORKER = r'''
-import sys, json, base64
-cfg = json.loads(sys.stdin.read())
-try:
-    from scrapling.fetchers import StealthyFetcher
-    page = StealthyFetcher.fetch(
-        cfg["url"], headless=True, proxy=cfg["proxy"],
-        solve_cloudflare=False, wait=2500,
-        timeout=cfg["timeout"] * 1000, blocked_domains=cfg.get("blocked"),
-    )
-    html = page.html_content or ""
-    st = getattr(page, "status", 0) or 200
-    sys.stdout.write("RESULT:" + json.dumps(
-        {"status": st, "html_b64": base64.b64encode(html.encode("utf-8", "ignore")).decode()}))
-except Exception as e:
-    sys.stdout.write("RESULT:" + json.dumps({"error": type(e).__name__ + ": " + str(e)}))
-'''
-
-
-def _stealthy_fetch_hard(url: str, timeout: int, blocked) -> tuple[int, str]:
-    """Camoufox en subproceso con timeout duro + kill de grupo. Nunca cuelga el
-    hilo llamante más de `timeout + 12` s."""
-    cfg = json.dumps({"url": url, "proxy": PROXY_URL, "timeout": timeout, "blocked": blocked})
-    hard = timeout + 12
-    proc = subprocess.Popen(
-        [sys.executable, "-c", _STEALTHY_WORKER],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, start_new_session=True,
-    )
-    try:
-        out, err = proc.communicate(input=cfg, timeout=hard)
-    except subprocess.TimeoutExpired:
-        # Colgado → matar TODO el grupo (hijo + Firefox nietos) para no dejar zombis.
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            proc.kill()
-        try:
-            proc.communicate(timeout=5)
-        except Exception:
-            pass
-        raise TimeoutError(f"stealthy hard-timeout tras {hard}s (subproceso matado)")
-
-    i = (out or "").rfind("RESULT:")
-    if i < 0:
-        raise RuntimeError("stealthy sin resultado: " + ((err or out or "")[:200]))
-    data = json.loads(out[i + 7:])
-    if "error" in data:
-        raise RuntimeError(data["error"])
-    return int(data.get("status") or 200), base64.b64decode(data["html_b64"]).decode("utf-8", "ignore")
-
-
 def _http_get(url: str, fetcher: str, timeout: int, accept_json: bool = False) -> tuple[int, str]:
     """GET con Scrapling, devuelve (status, body). Proxy US SIEMPRE (Target/Walmart
     rechazan IPs no-US). 'fetcher' = curl_cffi TLS-Chrome (rápido); 'stealthy' =
     Camoufox (para PerimeterX de Walmart)."""
-    from scrapling.fetchers import Fetcher
+    from scrapling.fetchers import Fetcher, StealthyFetcher
 
     headers = {
         "Accept": ("application/json,text/plain,*/*" if accept_json
@@ -218,8 +147,16 @@ def _http_get(url: str, fetcher: str, timeout: int, accept_json: bool = False) -
     if fetcher == "stealthy" and not accept_json:
         super_id = _detectar_super(url)
         blocked = _BLOCKED_DOMAINS if super_id in ("walmart", "target") else None
-        # Camoufox aislado en subproceso con matadero duro (ver _stealthy_fetch_hard).
-        return _stealthy_fetch_hard(url, timeout, blocked)
+        page = StealthyFetcher.fetch(
+            url,
+            headless=True,
+            proxy=PROXY_URL,
+            solve_cloudflare=False,   # Target/Walmart usan Akamai/PerimeterX, no Cloudflare
+            wait=2500,
+            timeout=timeout * 1000,
+            blocked_domains=blocked,
+        )
+        return getattr(page, "status", 0) or 200, page.html_content or ""
 
     page = Fetcher.get(url, proxy=PROXY_URL, impersonate="chrome", timeout=timeout, headers=headers)
     body = page.body
