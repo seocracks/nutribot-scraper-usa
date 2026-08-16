@@ -10,17 +10,23 @@ PerimeterX) aunque la IP sea de EE. UU. Scrapling combina el TLS de Chrome
 Kroger NO pasa por aquí: tiene API oficial y se consume directo desde PHP.
 
 Endpoints:
-  POST /scrape        — scrapea el precio de una URL de producto (Target/Walmart)
-  POST /scrape-batch  — N URLs en paralelo
-  POST /fetch-json    — GET crudo de un endpoint JSON (RedSky search/pdp) con TLS Chrome
-  POST /fetch-html    — GET de una página con fallback a browser real (Walmart PDP)
-  GET  /health        — healthcheck (sin auth)
+  POST /scrape          — scrapea una URL de producto (Target/Walmart). Walmart
+                          devuelve además `detalle` (ficha completa: marca,
+                          breadcrumbs, ingredientes, especificaciones…)
+  POST /scrape-batch    — N URLs en paralelo
+  POST /walmart-search  — término → ~55-62 productos CON precio por página.
+                          La vía barata (2-3 KB/producto en el cable) para
+                          descubrimiento y refresco masivo de precios
+  POST /fetch-json      — GET crudo de un endpoint JSON (RedSky search/pdp) con TLS Chrome
+  POST /fetch-html      — GET de una página con fallback a browser real (Walmart PDP)
+  GET  /health          — healthcheck (sin auth)
 
 Autenticación: header `Authorization: Bearer <SCRAPER_API_KEY>`.
 Configuración: variables de entorno (ver README).
 """
 import os
 import re
+import gzip
 import time
 import json
 import random
@@ -29,7 +35,7 @@ import asyncio
 from html import unescape
 from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 from fastapi import FastAPI, HTTPException, Header, status
 from pydantic import BaseModel, Field
@@ -76,6 +82,12 @@ class FetchRequest(BaseModel):
     timeout: int = Field(60, ge=5, le=300)
 
 
+class WalmartSearchRequest(BaseModel):
+    termino: str = Field(..., min_length=1, max_length=120)
+    pagina: int = Field(1, ge=1, le=25)
+    timeout: int = Field(60, ge=5, le=300)
+
+
 class ScrapeResult(BaseModel):
     id: Optional[int | str] = None
     url: str
@@ -93,6 +105,12 @@ class ScrapeResult(BaseModel):
     upc: Optional[str] = None
     es_ficha: bool = False
     error: Optional[str] = None
+    # Bytes ~facturables en el cable (gzip aprox., suma de TODOS los intentos).
+    # El proxy DataImpulse cobra por GB: es el contador de coste. Solo Walmart.
+    wire_bytes: int = 0
+    # Ficha COMPLETA de Walmart (nombre, marca, upc, breadcrumbs, ingredientes,
+    # especificaciones, foto, vendedor…) para walmartDetalle() del PHP. None en Target.
+    detalle: Optional[dict] = None
 
 
 # ─── Lógica de scraping ─────────────────────────────────────────
@@ -271,48 +289,325 @@ def _scrape_target(url: str, timeout: int) -> dict:
 
 
 # ─── Extractor: Walmart (__NEXT_DATA__) ─────────────────────────
-# EXPERIMENTAL: Walmart usa PerimeterX (bot-management agresivo). La vía rápida
-# (curl_cffi) suele bastar para el JSON embebido; si devuelve el reto, cae al
-# browser real. Pendiente de validar en el VPS con proxy US residencial cuando
-# se aborde Walmart (hoy el catálogo USA va con Kroger + Target).
-def _scrape_walmart(html: str, status_code: int) -> dict:
-    precio_centimos = None
-    unidad_venta = None
-    upc = None
-    es_ficha = False
+# VALIDADO 2026-08-16 (antes EXPERIMENTAL): prueba de ~50 peticiones + validación
+# de 150 productos aleatorios del catálogo, desde IP-ES con DataImpulse país-US y
+# TLS de Chrome (curl_cffi): 0 bloqueos PerimeterX en 159 peticiones, 100 % de
+# fichas OK (descontando 404 legítimos = producto retirado), UPC correcto 97 %.
+# El fetcher rápido BASTA; el browser real (stealthy) queda como escape manual.
+#
+# Las rutas de FICHA cuelgan de props.pageProps.initialData.data del
+# <script id="__NEXT_DATA__">; las de BÚSQUEDA, de …initialData.searchResult
+# (con currentPrice null y el precio como string "$6.96" — son shapes distintos).
 
-    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.+?)</script>', html, re.DOTALL)
-    if m:
+_WALMART_RE_NEXT = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.+?)</script>', re.DOTALL)
+_WALMART_REINTENTOS = 3
+
+
+def _wire_aprox(html: str) -> int:
+    """Bytes ~facturables por el proxy para este body (DataImpulse cobra por GB).
+    Walmart sirve gzip/brotli y curl lo descomprime antes de llegar aquí, así que
+    se re-comprime en local para estimar lo que viajó por el cable. Medido
+    2026-08-16: PDP de 493 KB en plano → 112,7 KB gzip-6 vs 107-112 KB reales."""
+    try:
+        return len(gzip.compress((html or "").encode("utf-8", "ignore"), 6))
+    except Exception:
+        return int(len(html or "") * 0.25)
+
+
+def _walmart_es_bloqueo(status_code: int, html: str) -> bool:
+    """Bloqueo PerimeterX: status del challenge o marcadores del muro en el HTML.
+    ⚠ NO usar 'captcha' ni 'blocked' a secas como señal: aparecen dentro del
+    bundle JS de páginas perfectamente VÁLIDAS (falso positivo medido al montar
+    la prueba del 2026-08-16)."""
+    if status_code in (403, 412, 429):
+        return True
+    h = (html or "").lower()
+    return "px-captcha" in h or "robot or human" in h
+
+
+def _walmart_next_root(html: str) -> Optional[dict]:
+    """JSON completo del <script id="__NEXT_DATA__">, o None si falta/no parsea."""
+    m = _WALMART_RE_NEXT.search(html or "")
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _walmart_get(url: str, timeout: int, intentos: int = _WALMART_REINTENTOS) -> tuple[int, str, str, int]:
+    """GET a walmart.com con el fetcher rápido y REINTENTOS obligatorios.
+
+    Por qué reintentos (mismo patrón que _redsky_get_json en Target):
+      · el proxy DataImpulse da `SSLError / curl(35) TLS connect error` esporádico
+        (~1 de cada 15-20 peticiones): es transitorio, el reintento sale por otra
+        IP y funciona;
+      · un bloqueo PerimeterX puntual también se resuelve rotando de IP.
+    Un 404 NO se reintenta: es producto retirado del catálogo (dato, no fallo).
+    Éxito = HTTP 200 con __NEXT_DATA__ presente (el caller valida el contenido).
+
+    Devuelve (status, html, error, wire_bytes). error != '' solo si TODOS los
+    intentos fallaron; wire_bytes acumula todos los intentos (coste real)."""
+    ultimo_status, ultimo_html, ultimo_err, wire = 0, "", "", 0
+    for i in range(1, max(1, intentos) + 1):
+        if i > 1:
+            time.sleep(random.uniform(1.0, 2.0))
         try:
-            data = json.loads(m.group(1))
-            product = (((data.get("props") or {}).get("pageProps") or {})
-                       .get("initialData") or {}).get("data", {}).get("product") or {}
-            if product:
-                es_ficha = True
-                pmap = product.get("priceInfo") or {}
-                cur = (pmap.get("currentPrice") or {}).get("price")
-                precio_centimos = _precio_a_centimos(cur)
-                upc = re.sub(r"\D", "", str(product.get("upc") or "")) or None
-        except Exception:
-            pass
+            status_code, html = _http_get(url, "fetcher", timeout)
+        except Exception as e:
+            ultimo_status, ultimo_html = 0, ""
+            ultimo_err = f"{type(e).__name__}: {e}"
+            log.info("Walmart intento %d/%d error de red (%s), reintentando", i, intentos, type(e).__name__)
+            continue
+        wire += _wire_aprox(html)
+        if status_code == 404:
+            return 404, html, "", wire
+        if _walmart_es_bloqueo(status_code, html):
+            ultimo_status, ultimo_html = status_code, html
+            ultimo_err = f"bloqueo PerimeterX (HTTP {status_code})"
+            log.info("Walmart intento %d/%d bloqueado por PerimeterX, rotando IP", i, intentos)
+            continue
+        if status_code == 200 and _WALMART_RE_NEXT.search(html or ""):
+            return status_code, html, "", wire
+        ultimo_status, ultimo_html = status_code, html
+        ultimo_err = f"HTTP {status_code} sin __NEXT_DATA__"
+    return ultimo_status, ultimo_html, ultimo_err, wire
 
-    # Fallback regex al JSON-LD si no hubo __NEXT_DATA__ útil
-    if precio_centimos is None:
-        m = re.search(r'"price"\s*:\s*"?(\d+(?:\.\d{1,2})?)"?', html)
-        if m:
-            precio_centimos = _precio_a_centimos(m.group(1))
-            es_ficha = es_ficha or precio_centimos is not None
 
-    return {
-        "http_code": status_code,
-        "size_bytes": len(html),
-        "precio_centimos": precio_centimos,
-        "unidad_venta": unidad_venta,
-        "precio_ref_centimos": None,
-        "precio_ref_unidad": None,
-        "upc": upc,
-        "es_ficha": es_ficha,
+def _walmart_extraer_pdp(data_node: dict) -> tuple[dict, dict]:
+    """Ficha del nodo initialData.data del PDP → (campos ScrapeResult, detalle).
+
+    Rutas VERIFICADAS 2026-08-16 contra peticiones reales:
+      product.name / brand / usItemId / upc (12 dígitos, ya normalizado)
+      product.priceInfo.currentPrice.price      → precio (float, ej. 3.58)
+      product.priceInfo.unitPrice.priceString   → "2.8 ¢/fl oz"
+      product.priceInfo.wasPrice.price          → precio anterior (puede ser null)
+      product.availabilityStatus                → IN_STOCK / OUT_OF_STOCK
+      product.sellerName                        → "Walmart.com" o marketplace
+      product.category.path[].name              → breadcrumbs (filtro solo-alimentos)
+      product.imageInfo.thumbnailUrl            → foto
+      idml.ingredients.ingredients.value        → ingredientes (string)
+      idml.specifications[] {name,value}        → "Net content statement" → tamaño"""
+    prod = data_node.get("product") or {}
+    idml = data_node.get("idml") or {}
+    pi   = prod.get("priceInfo") or {}
+    cur  = pi.get("currentPrice") if isinstance(pi.get("currentPrice"), dict) else None
+    unit = pi.get("unitPrice") if isinstance(pi.get("unitPrice"), dict) else None
+    was  = pi.get("wasPrice") if isinstance(pi.get("wasPrice"), dict) else None
+
+    precio = _precio_a_centimos((cur or {}).get("price"))
+
+    breadcrumbs = []
+    for c in ((prod.get("category") or {}).get("path") or []):
+        nombre_miga = str((c or {}).get("name") or "").strip()
+        if nombre_miga:
+            breadcrumbs.append(nombre_miga)
+
+    ingredientes = ""
+    ing = idml.get("ingredients")
+    if isinstance(ing, dict):
+        ingredientes = str((ing.get("ingredients") or {}).get("value") or "").strip()
+
+    especificaciones = []
+    tamano = ""
+    for s in (idml.get("specifications") or []):
+        if not isinstance(s, dict) or s.get("name") is None:
+            continue
+        spec = {"name": str(s.get("name")), "value": str(s.get("value") or "")}
+        especificaciones.append(spec)
+        n = spec["name"].lower()
+        if not tamano and ("net content" in n or "net weight" in n):
+            tamano = spec["value"]
+
+    # TODAS las fotos del producto (6-12 sin etiquetar, imageInfo.allImages[].url):
+    # las necesita el OCR de etiquetas nutricionales del fork
+    # (ocrImagenesEtiquetaWalmart), que antes las sacaba del endpoint `product`
+    # de BlueCart a 1 crédito por producto.
+    fotos = []
+    for a in ((prod.get("imageInfo") or {}).get("allImages") or []):
+        u = str((a or {}).get("url") or "").strip()
+        if u and u not in fotos:
+            fotos.append(u)
+
+    detalle = {
+        "us_item_id":               str(prod.get("usItemId") or ""),
+        "nombre":                   unescape(str(prod.get("name") or "")).strip(),
+        "marca":                    unescape(str(prod.get("brand") or "")).strip(),
+        "upc":                      re.sub(r"\D", "", str(prod.get("upc") or "")),
+        "precio_centimos":          precio,
+        "precio_ref":               str((unit or {}).get("priceString") or ""),
+        "precio_anterior_centimos": _precio_a_centimos((was or {}).get("price")),
+        "disponibilidad":           str(prod.get("availabilityStatus") or ""),
+        "vendedor":                 str(prod.get("sellerName") or ""),
+        "breadcrumbs":              breadcrumbs,
+        "foto":                     str((prod.get("imageInfo") or {}).get("thumbnailUrl") or ""),
+        "fotos":                    fotos,
+        "ingredientes":             ingredientes,
+        "tamano":                   tamano,
+        "especificaciones":         especificaciones,
     }
+    campos = {
+        "precio_centimos":     precio,
+        "unidad_venta":        tamano or None,
+        "precio_ref_centimos": _precio_a_centimos((unit or {}).get("price")),
+        "precio_ref_unidad":   detalle["precio_ref"] or None,
+        "upc":                 detalle["upc"] or None,
+        # Señal FIABLE de éxito: __NEXT_DATA__ parsea Y hay product Y currentPrice
+        # no es null. (Con precio null la página puede ser válida — OUT_OF_STOCK.)
+        "es_ficha":            bool(prod) and precio is not None,
+    }
+    return campos, detalle
+
+
+def _walmart_resultado(status_code: int, html: str, err: str, wire: int) -> dict:
+    """Clasifica la respuesta de _walmart_get como ScrapeResult (dict)."""
+    base = {"http_code": status_code, "size_bytes": len(html or ""),
+            "wire_bytes": wire, "es_ficha": False}
+    if err:
+        base["error"] = err
+        return base
+    if status_code == 404:
+        # Producto RETIRADO del catálogo: dato correcto, no fallo. El caller debe
+        # marcarlo no disponible y NO reintentarlo.
+        base["error"] = "404 producto retirado"
+        return base
+    root = _walmart_next_root(html)
+    data_node = ((((root or {}).get("props") or {}).get("pageProps") or {})
+                 .get("initialData") or {}).get("data")
+    if not isinstance(data_node, dict) or not (data_node.get("product") or {}):
+        base["error"] = "pagina sin ficha de producto (redirigida a categoria/busqueda?)"
+        return base
+    campos, detalle = _walmart_extraer_pdp(data_node)
+    base.update(campos)
+    base["detalle"] = detalle
+    if not base["es_ficha"]:
+        base["error"] = f"currentPrice null (disponibilidad={detalle['disponibilidad'] or '?'})"
+    return base
+
+
+# ─── Búsqueda Walmart (/walmart-search) ─────────────────────────
+def _walmart_buscar_stacks(nodo, profundidad: int = 0):
+    """Encuentra la clave `itemStacks` RECURSIVAMENTE. Walmart cambia el nivel de
+    anidamiento cada pocos meses (hoy: props.pageProps.initialData.searchResult.
+    itemStacks, verificado 2026-08-16) — no atarse a la ruta exacta."""
+    if profundidad > 12:
+        return None
+    if isinstance(nodo, dict):
+        v = nodo.get("itemStacks")
+        if isinstance(v, list):
+            return v
+        for val in nodo.values():
+            r = _walmart_buscar_stacks(val, profundidad + 1)
+            if r is not None:
+                return r
+    elif isinstance(nodo, list):
+        for val in nodo:
+            r = _walmart_buscar_stacks(val, profundidad + 1)
+            if r is not None:
+                return r
+    return None
+
+
+def _walmart_precio_busqueda(pi: dict) -> Optional[int]:
+    """Precio de un item de BÚSQUEDA → céntimos. Aquí llega como STRING '$6.96'
+    en priceInfo.linePrice (currentPrice es null en búsqueda; solo el PDP lo trae
+    como float). 'From $…'/'2 options' = rango de variantes, no un precio → None."""
+    for clave in ("linePrice", "itemPrice"):
+        s = str(pi.get(clave) or "").strip()
+        if not s:
+            continue
+        if re.search(r"\b(from|options)\b", s, re.IGNORECASE):
+            return None
+        m = re.search(r"\$\s*([\d,]+(?:\.\d{1,2})?)", s)
+        if m:
+            try:
+                return int(round(float(m.group(1).replace(",", "")) * 100))
+            except ValueError:
+                return None
+    return None
+
+
+def _walmart_item_busqueda(it: dict) -> Optional[dict]:
+    """Normaliza un item de itemStacks[].items[]. None si no es un producto usable."""
+    us_id = str(it.get("usItemId") or "").strip()
+    nombre = unescape(str(it.get("name") or "")).strip()
+    if not us_id or not nombre:
+        return None
+    pi = it.get("priceInfo") if isinstance(it.get("priceInfo"), dict) else {}
+    canonical = str(it.get("canonicalUrl") or "").split("?")[0]
+    imagen = it.get("imageInfo") if isinstance(it.get("imageInfo"), dict) else {}
+    disp = it.get("availabilityStatusV2") if isinstance(it.get("availabilityStatusV2"), dict) else {}
+    return {
+        "us_item_id":      us_id,
+        "nombre":          nombre,
+        # ⚠ brand llega null casi siempre en búsqueda (igual que en BlueCart):
+        # la marca fiable la da el PDP (/scrape → detalle).
+        "marca":           unescape(str(it.get("brand") or "")).strip(),
+        "precio_centimos": _walmart_precio_busqueda(pi),
+        "precio_unidad":   str(pi.get("unitPrice") or "").strip(),   # "21.8 ¢/oz"
+        "foto":            str(imagen.get("thumbnailUrl") or it.get("image") or ""),
+        "enlace":          ("https://www.walmart.com" + canonical) if canonical.startswith("/")
+                           else f"https://www.walmart.com/ip/{us_id}",
+        "disponibilidad":  str(disp.get("value") or ""),
+        "vendedor":        str(it.get("sellerName") or ""),
+        "patrocinado":     bool(it.get("isSponsoredFlag")),
+    }
+
+
+def _walmart_search_blocking(termino: str, pagina: int, timeout: int) -> dict:
+    """Página de búsqueda → lista normalizada. Es la vía BARATA: ~55-62 productos
+    con precio por ~120-150 KB en el cable ≈ 2-3 KB/producto, ~47× menos que pedir
+    ficha a ficha. Para descubrimiento y refresco masivo de precios; la ficha
+    completa (/scrape) se reserva para altas y para completar UPC/ingredientes.
+
+    ⚠ SSR DEGRADADO (medido 2026-08-16): de vez en cuando Walmart sirve la página
+    con itemStacks completo pero SIN los precios hidratados — la misma búsqueda
+    dio 0/62 items con precio en una pasada y 62/62 en la siguiente. Si pasa, se
+    reintenta la página ENTERA (otra IP suele traer el SSR bueno). Sin este guard
+    un refresco de precios se saltaría el lote completo en silencio."""
+    if THROTTLE_MIN > 0:
+        time.sleep(random.uniform(THROTTLE_MIN, max(THROTTLE_MIN, THROTTLE_MAX)))
+    url = "https://www.walmart.com/search?q=" + quote_plus(termino)
+    if pagina > 1:
+        url += f"&page={pagina}"
+    log.info("Walmart search %r p%d", termino, pagina)
+
+    wire_total = 0
+    resultado = {"status": 0, "size_bytes": 0, "wire_bytes": 0,
+                 "total": 0, "items": [], "error": "sin intentos"}
+    for intento in range(1, _WALMART_REINTENTOS + 1):
+        status_code, html, err, wire = _walmart_get(url, timeout)
+        wire_total += wire
+        if err or not html:
+            # _walmart_get YA reintentó el transporte (TLS/PX): no insistir más.
+            resultado = {"status": status_code, "size_bytes": 0, "wire_bytes": wire_total,
+                         "total": 0, "items": [], "error": err or "sin contenido"}
+            break
+        stacks = _walmart_buscar_stacks(_walmart_next_root(html))
+        if stacks is None:
+            resultado = {"status": status_code, "size_bytes": len(html), "wire_bytes": wire_total,
+                         "total": 0, "items": [],
+                         "error": "sin itemStacks en __NEXT_DATA__ (cambio de layout?)"}
+            break
+        items = []
+        for stack in stacks:
+            for it in ((stack or {}).get("items") or []):
+                if isinstance(it, dict):
+                    norm = _walmart_item_busqueda(it)
+                    if norm:
+                        items.append(norm)
+        resultado = {"status": status_code, "size_bytes": len(html), "wire_bytes": wire_total,
+                     "total": len(items), "items": items, "error": None}
+        con_precio = sum(1 for x in items if x["precio_centimos"] is not None)
+        if items and con_precio == 0 and intento < _WALMART_REINTENTOS:
+            log.info("Walmart search %r p%d: %d items con 0 precios (SSR degradado), reintentando",
+                     termino, pagina, len(items))
+            time.sleep(random.uniform(1.0, 2.0))
+            continue
+        break
+    return resultado
 
 
 def _scrape_blocking(url: str, fetcher: str, timeout: int) -> dict:
@@ -330,8 +625,14 @@ def _scrape_blocking(url: str, fetcher: str, timeout: int) -> dict:
         if super_id == "target":
             r = _scrape_target(url, timeout)
         elif super_id == "walmart":
-            status_code, html = _http_get(url, fetcher, timeout)
-            r = _scrape_walmart(html, status_code)
+            if fetcher == "stealthy":
+                # Escape manual: browser real, por si PerimeterX endureciera algún
+                # día. La vía validada es el fetcher rápido con reintentos.
+                status_code, html = _http_get(url, "stealthy", timeout)
+                r = _walmart_resultado(status_code, html, "", _wire_aprox(html))
+            else:
+                status_code, html, err, wire = _walmart_get(url, timeout)
+                r = _walmart_resultado(status_code, html, err, wire)
         else:
             base.update({"http_code": 0, "time_ms": int((time.time() - t0) * 1000),
                          "size_bytes": 0, "error": f"Cadena no soportada: {super_id}"})
@@ -367,12 +668,19 @@ def _fetch_html_blocking(url: str, timeout: int) -> tuple[int, str, str]:
     if host not in _FETCH_HTML_HOSTS:
         return 400, "", f"host no permitido: {host}"
     err_fast = ""
-    try:
-        status_code, html = _http_get(url, "fetcher", timeout)
-        if status_code == 200 and html and "px-captcha" not in html.lower() and "__NEXT_DATA__" in html:
+    if "walmart" in host:
+        # Vía validada 2026-08-16: fetcher rápido con reintentos (rotación de IP).
+        # Un 404 sale directo (producto retirado; el browser real no lo cambiaría).
+        status_code, html, err_fast, _ = _walmart_get(url, timeout)
+        if not err_fast and html and status_code in (200, 404):
             return status_code, html, ""
-    except Exception as e:
-        err_fast = f"{type(e).__name__}: {e}"
+    else:
+        try:
+            status_code, html = _http_get(url, "fetcher", timeout)
+            if status_code == 200 and html and "px-captcha" not in html.lower() and "__NEXT_DATA__" in html:
+                return status_code, html, ""
+        except Exception as e:
+            err_fast = f"{type(e).__name__}: {e}"
     try:
         status_code, html = _http_get(url, "stealthy", timeout)
         return status_code, html, ""
@@ -426,6 +734,22 @@ async def scrape_batch(req: ScrapeBatchRequest, authorization: Optional[str] = H
         return result
 
     return await asyncio.gather(*[_do_one(it) for it in req.items])
+
+
+@app.post("/walmart-search")
+async def walmart_search(req: WalmartSearchRequest, authorization: Optional[str] = Header(None)):
+    """Búsqueda de Walmart: término → ~55-62 productos con precio por página.
+    La vía BARATA (2-3 KB/producto en el cable ≈ 47× menos que ficha a ficha)
+    para descubrimiento de catálogo y refresco masivo de precios. La ficha
+    completa (/scrape) queda para altas y para completar UPC/ingredientes."""
+    _check_auth(authorization)
+    loop = asyncio.get_event_loop()
+    r = await loop.run_in_executor(_executor, _walmart_search_blocking,
+                                   req.termino, req.pagina, req.timeout)
+    if r.get("error"):
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY,
+                            f"walmart-search '{req.termino}' p{req.pagina}: {r['error']}")
+    return r
 
 
 @app.post("/debug-egress")

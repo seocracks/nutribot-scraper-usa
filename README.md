@@ -49,19 +49,29 @@ Todos requieren `Authorization: Bearer <SCRAPER_API_KEY>`, excepto `/health`.
   RedSky y este servicio la busca; el PHP parsea (ya tiene `targetNormalizarProducto`).
 - **`POST /scrape`** `{url, fetcher?, timeout}` — precio normalizado de una URL de
   producto. Target (por tcin → RedSky pdp) y Walmart (`__NEXT_DATA__`). Devuelve
-  `ScrapeResult` con `precio_centimos`, `unidad_venta`, `upc`, `es_ficha`.
+  `ScrapeResult` con `precio_centimos`, `unidad_venta`, `upc`, `es_ficha`; en
+  Walmart añade `detalle` (marca, breadcrumbs, ingredientes, especificaciones,
+  foto, vendedor, disponibilidad) y `wire_bytes` (coste aprox. en el cable —
+  el proxy cobra por GB). Reintenta 3× (TLS transitorio / rotación anti-PX);
+  un 404 NO se reintenta (producto retirado: dato, no fallo).
 - **`POST /scrape-batch`** `{items:[{id,url}], fetcher?, timeout}` — N en paralelo.
+- **`POST /walmart-search`** `{termino, pagina?, timeout?}` — búsqueda de Walmart:
+  ~55-62 productos CON precio por ~120-150 KB en el cable (2-3 KB/producto, 47×
+  más barato que ficha a ficha). Para descubrimiento y refresco masivo de precios.
+  Con guard anti "SSR degradado" (página con items pero 0 precios → reintento).
 - **`POST /fetch-html`** `{url, timeout}` — HTML de una página (Walmart PDP) con
-  fallback a browser real. Para cuando se aborde Walmart.
+  fallback a browser real.
 
 ## Estado
 
-- **Target vía `/fetch-json`**: listo. Falta validarlo EN EL VPS con proxy US real
-  (desde IP europea RedSky da 403 incluso con proxy en curl; la hipótesis es que el
-  TLS de Chrome de Scrapling + IP US lo pasa, igual que Carrefour en el ES).
-- **Walmart**: extractor `__NEXT_DATA__` escrito pero **EXPERIMENTAL** — PerimeterX
-  es agresivo; se validará cuando el proyecto aborde Walmart (hoy el catálogo va con
-  Kroger + Target). El programa de afiliados de Walmart es la vía preferente.
+- **Target vía `/fetch-json`**: en producción.
+- **Walmart: VALIDADO 2026-08-16** (antes EXPERIMENTAL). Prueba de ~50 peticiones +
+  validación con 150 productos aleatorios del catálogo (fetcher rápido + DataImpulse
+  país-US): **0 bloqueos PerimeterX en 159 peticiones, 100 % de fichas OK
+  descontando 404 legítimos, UPC correcto 97 %**. Es el proveedor activo del fork
+  (`WALMART_PROVEEDOR='scraper'` en config.php) en sustitución de BlueCart
+  (83 $/mes → ~1-3 $/mes en GB de proxy). BlueCart queda conmutable como fallback
+  y el afiliado walmart.io/Impact sigue siendo la vía preferente a largo plazo.
 
 ## Probar localmente
 
